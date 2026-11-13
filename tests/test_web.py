@@ -104,6 +104,93 @@ def test_full_migration_via_web_and_cutover_writes():
     assert not bad
 
 
+def test_write_switch_keeps_reports_visible_over_http():
+    """HTTP-level regression for the cutover read/write switch.
+
+    Uses the same named checkpoints as the engine tests so the interleaving is
+    deterministic: a report committed before cutover must stay visible while
+    the state is ``cutover``, and a correction accepted while the old DB lock
+    is held must end up on the long table, not the frozen wide one.
+    """
+    import threading
+
+    from app import db
+    from app import hooks
+    from app.migrator import Migrator
+
+    # This test runs after the earlier ones already completed the shared
+    # database, so use a throwaway data directory for a fresh migration.
+    import tempfile
+    from unittest import mock
+
+    import importlib
+
+    migrator_mod = importlib.import_module("app.migrator")
+
+    tmp = tempfile.mkdtemp(prefix="migration-web-race-")
+    with mock.patch.multiple(
+        db, DATA_DIR=tmp,
+        OLD_DB_PATH=os.path.join(tmp, "old.db"),
+        NEW_DB_PATH=os.path.join(tmp, "new.db"),
+    ), mock.patch.object(
+        migrator_mod, "OLD_DB_PATH", os.path.join(tmp, "old.db")
+    ):
+        db.init_dbs()
+        with db.old_conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            for i in range(1, 31):
+                c.execute(
+                    "INSERT INTO reports(report_id, chromium, lead) "
+                    "VALUES (?, ?, ?)",
+                    (f"W{i:03d}", f"{i}.1", f"{i}.2"),
+                )
+            c.execute("COMMIT")
+
+        m = Migrator()
+        m.pause_before_cutover = threading.Event()
+        try:
+            assert m.start()
+            flipped = threading.Event()
+            release = threading.Event()
+
+            def at_flip(**_kw):
+                flipped.set()
+                release.wait(timeout=10)
+
+            hooks.set_hook("cutover_state_flipped", at_flip)
+            m.pause_before_cutover.set()
+            assert flipped.wait(timeout=10)
+
+            # Commit a new report while state is ``cutover``.
+            resp = client.post("/reports", data={
+                "report_id": "RACE01", "chromium": "5.5", "lead": "",
+            })
+            assert resp.status_code in (302, 303)
+            body = client.get("/api/reports/RACE01").get_json()
+            assert body == {
+                "report_id": "RACE01", "chromium": "5.5", "lead": None,
+            }, body
+            # Listing must include it too (no "missing during switch").
+            page = client.get("/").get_data(as_text=True)
+            assert "RACE01" in page
+
+            release.set()
+            hooks.clear_hooks()
+            assert _wait_state("completed"), progress()
+            body = client.get("/api/reports/RACE01").get_json()
+            assert body["chromium"] == "5.5"
+            # The old table is frozen and holds it from the drain.
+            with db.old_conn() as c:
+                assert c.execute(
+                    "SELECT 1 FROM reports WHERE report_id='RACE01'"
+                ).fetchone()
+        finally:
+            hooks.clear_hooks()
+            if m.pause_before_cutover is not None:
+                m.pause_before_cutover.set()
+            m.stop()
+
+
 def test_query_unknown_returns_404():
     resp = client.get("/api/reports/NO-SUCH-ID")
     assert resp.status_code == 404

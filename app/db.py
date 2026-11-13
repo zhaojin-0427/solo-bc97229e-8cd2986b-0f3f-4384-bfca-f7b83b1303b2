@@ -33,6 +33,10 @@ META_STARTED_AT = "started_at"
 META_COMPLETED_AT = "completed_at"
 META_SEED_TS = "seed_ts"
 
+# Where a business write/read must go for a given lifecycle state.
+STORE_WIDE = "wide"
+STORE_LONG = "long"
+
 ITEMS = ("chromium", "lead")
 
 
@@ -138,10 +142,14 @@ def init_dbs() -> None:
 # --------------------------------------------------------------------------- #
 # Metadata helpers
 # --------------------------------------------------------------------------- #
-def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
-    row = conn.execute(
+def _meta_row(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
+    return conn.execute(
         "SELECT value FROM migration_meta WHERE key = ?", (key,)
     ).fetchone()
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = _meta_row(conn, key)
     return row["value"] if row else None
 
 
@@ -159,6 +167,21 @@ def get_state(conn: sqlite3.Connection) -> str:
     return get_meta(conn, META_STATE) or STATE_IDLE
 
 
-def is_long_table_live(state: str) -> bool:
-    """Whether application reads and writes must use the long table."""
-    return state in (STATE_CUTOVER, STATE_COMPLETED)
+def get_state_snapshot(conn: sqlite3.Connection) -> str:
+    """Read the lifecycle state from one consistent ``new.db`` snapshot.
+
+    Callers ``BEGIN`` first; a plain SELECT already pins the snapshot, this
+    helper documents the intent and keeps routing centralized.
+    """
+    return get_state(conn)
+
+
+def resolve_store(state: str) -> str:
+    """Which store application reads and writes must use for ``state``.
+
+    The wide table is the write target until the cutover transaction commits
+    ``completed``.  ``cutover`` deliberately keeps writes on the wide table
+    (which is still mutable and will be drained) so a correction is never
+    written to the long table and then overwritten by a late copy.
+    """
+    return STORE_LONG if state == STATE_COMPLETED else STORE_WIDE

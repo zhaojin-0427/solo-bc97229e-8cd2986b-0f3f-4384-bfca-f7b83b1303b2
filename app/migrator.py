@@ -9,10 +9,14 @@ Guarantees implemented here:
   re-copying the whole database.
 * Reconciliation passes re-scan the wide table so corrections submitted
   while migration is running are never missed.
-* Cutover takes the old-database write lock before the final drain, then
-  flips state to ``completed`` atomically; rows written directly to the
-  long table are registered in ``locked_reports`` and late copies can
-  never overwrite them.
+* Cutover takes the old-database write lock before the final drain.  While
+  that lock is held the wide table cannot change, so the final completeness
+  check (every non-locked wide row present with identical values in the long
+  table) and the flip to ``completed`` are committed in a single new.db
+  transaction.  The business write path takes the same old-DB lock before
+  choosing its table, so after that commit it can only write the long table.
+* Rows written directly to the long table are registered in
+  ``locked_reports`` and late copies can never overwrite them.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from . import hooks
 from .db import (
     META_COMPLETED_AT,
     META_LAST_BATCH,
@@ -53,11 +58,16 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class _Incomplete(Exception):
+    """The long table was not complete at the instant cutover wanted to flip."""
+
+
 class Migrator:
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self.pause_before_cutover: threading.Event | None = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -141,6 +151,11 @@ class Migrator:
             if self._stop.is_set():
                 self._mark_stopped()
                 return
+            if self.pause_before_cutover is not None:
+                # Test hook: let a caller create the exact interleaving it
+                # wants to regress while the engine is between "tail drain
+                # done" and "cutover state published".
+                self.pause_before_cutover.wait()
             self._cutover()
             if self._stop.is_set():
                 # Cutover failed and rolled the state back to running;
@@ -274,43 +289,89 @@ class Migrator:
     # ------------------------------------------------------------------ #
     # Reconciliation: re-scan everything, re-copy changed/missing rows
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _wide_rows(conn: sqlite3.Connection) -> dict[str, tuple]:
+        """Wide-table snapshot as ``{report_id: (chromium, lead)}``.
+
+        Works with both ``sqlite3.Row`` rows and plain tuples (the cutover
+        lock connection is not always configured with a row factory).
+        """
+        return {
+            r[0]: (r[1], r[2])
+            for r in conn.execute(
+                "SELECT report_id, chromium, lead FROM reports"
+            )
+        }
+
+    @staticmethod
+    def _locked_all(conn: sqlite3.Connection) -> set[str]:
+        return {
+            r[0] for r in conn.execute("SELECT report_id FROM locked_reports")
+        }
+
+    @staticmethod
+    def _diff_rows(
+        conn: sqlite3.Connection,
+        wide_rows: dict[str, tuple],
+        locked: set[str],
+    ) -> list[tuple[str, str | None, str | None]]:
+        """Rows whose long-table copy is missing, short or out of date.
+
+        Values written by the application (``locked_reports``) are
+        authoritative on the long table and are always skipped.
+        """
+        long_map: dict[str, dict[str, str | None]] = {}
+        for r in conn.execute("SELECT report_id, item, value FROM results"):
+            long_map.setdefault(r[0], {})[r[1]] = r[2]
+        diff = []
+        for rid, (chromium, lead) in wide_rows.items():
+            if rid in locked:
+                continue
+            got = long_map.get(rid)
+            if (
+                got is None
+                or set(got) != set(ITEMS)
+                or got.get("chromium") != chromium
+                or got.get("lead") != lead
+            ):
+                diff.append((rid, chromium, lead))
+        return diff
+
     def _reconcile(self) -> int:
         with old_conn() as old:
-            wide_rows = old.execute(
-                "SELECT report_id, chromium, lead FROM reports"
-            ).fetchall()
+            wide_rows = self._wide_rows(old)
+        return self._reconcile_rows(wide_rows)
+
+    def _reconcile_rows(self, wide_rows: dict[str, tuple]) -> int:
+        """Copy every non-locked wide row that differs from the long table.
+
+        The diff is computed in a read transaction; the write transaction
+        re-reads ``locked_reports`` so an application write that committed
+        in between is never overwritten by a stale copy.
+        """
         with new_conn() as conn:
-            seen = {
-                r["report_id"]: r
-                for r in conn.execute(
-                    "SELECT report_id, chromium, lead FROM migration_seen"
-                )
-            }
-            locked = {
-                r["report_id"]
-                for r in conn.execute("SELECT report_id FROM locked_reports")
-            }
+            conn.execute("BEGIN")
+            try:
+                locked = self._locked_all(conn)
+                stale = self._diff_rows(conn, wide_rows, locked)
+            finally:
+                conn.execute("COMMIT")
 
-            stale: list[tuple[str, str | None, str | None]] = []
-            for row in wide_rows:
-                rid = row["report_id"]
-                if rid in locked:
-                    continue
-                prev = seen.get(rid)
-                if (
-                    prev is None
-                    or prev["chromium"] != row["chromium"]
-                    or prev["lead"] != row["lead"]
-                ):
-                    stale.append((rid, row["chromium"], row["lead"]))
+        if not stale:
+            return 0
 
-            if not stale:
-                return 0
-
+        applied = 0
+        with new_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                locked_now = self._locked_all(conn)
                 for rid, chromium, lead in stale:
+                    if rid in locked_now:
+                        # A concurrent app write made the long row
+                        # authoritative after our snapshot.
+                        continue
                     self._write_one(conn, rid, chromium, lead)
+                    applied += 1
                 set_meta(
                     conn,
                     META_TOTAL_ROWS,
@@ -323,13 +384,20 @@ class Migrator:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
-        return len(stale)
+        return applied
 
     # ------------------------------------------------------------------ #
     # Cutover: lock old writers, final drain, flip state
     # ------------------------------------------------------------------ #
     def _cutover(self) -> None:
         """Drain the last changes under the old-DB write lock and flip state.
+
+        The old-DB RESERVED lock is held from before the final drain until
+        the ``completed`` commit.  While it is held no business write can
+        commit (the write path serializes on that same lock before choosing
+        a table), so the completeness check below is evaluated against a
+        frozen wide table and completion plus store switch are published in
+        one new.db commit.
 
         On failure the lifecycle is rolled back to ``running`` (with the
         error recorded) so the web console can retry from the same progress;
@@ -339,6 +407,7 @@ class Migrator:
             conn.execute("BEGIN IMMEDIATE")
             set_meta(conn, META_STATE, STATE_CUTOVER)
             conn.execute("COMMIT")
+        hooks.trigger("cutover_state_flipped")
 
         # RESERVED lock on the business DB: new writers block (busy_timeout),
         # in-flight writers finish first, then we hold the lock.
@@ -348,18 +417,21 @@ class Migrator:
         try:
             lock_conn.execute("PRAGMA busy_timeout=30000")
             lock_conn.execute("BEGIN IMMEDIATE")
+            hooks.trigger("cutover_old_db_locked")
 
-            # Anything committed up to this instant is drained, and rows
-            # mirrored by app writers during cutover are locked/skipped.
-            self._reconcile()
-
-            with new_conn() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                set_meta(conn, META_STATE, STATE_COMPLETED)
-                set_meta(conn, META_COMPLETED_AT, _utcnow())
-                set_meta(conn, META_LAST_ERROR, "")
-                conn.execute("COMMIT")
-        except sqlite3.Error as exc:
+            for _attempt in range(3):
+                wide_rows = self._wide_rows(lock_conn)
+                self._reconcile_rows(wide_rows)
+                if self._complete_if_ready(lock_conn, wide_rows):
+                    hooks.trigger("cutover_completed")
+                    return
+                # A row slipped past the drain (e.g. a writer outside the
+                # application path).  The wide table cannot change while we
+                # hold the lock, so another drain converges.
+            raise _Incomplete(
+                "long table still differs after repeated locked drains"
+            )
+        except (sqlite3.Error, _Incomplete) as exc:
             with new_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 set_meta(conn, META_STATE, STATE_RUNNING)
@@ -377,6 +449,40 @@ class Migrator:
             except sqlite3.Error:
                 pass
             lock_conn.close()
+
+    def _complete_if_ready(
+        self, lock_conn: sqlite3.Connection, wide_rows: dict[str, tuple]
+    ) -> bool:
+        """Flip to ``completed`` after proving the long table is complete."""
+        with new_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                locked = self._locked_all(conn)
+                if self._diff_rows(conn, wide_rows, locked):
+                    conn.execute("ROLLBACK")
+                    return False
+
+                # Point of no return: the long table is complete *and* the
+                # wide table frozen (we hold its write lock).  This single
+                # commit is the switch for both readers (``completed``) and
+                # writers (same state check under the old-DB lock).
+                hooks.trigger("cutover_before_completed")
+                set_meta(conn, META_STATE, STATE_COMPLETED)
+                set_meta(conn, META_COMPLETED_AT, _utcnow())
+                set_meta(conn, META_LAST_ERROR, "")
+                set_meta(
+                    conn,
+                    META_TOTAL_ROWS,
+                    conn.execute(
+                        "SELECT COUNT(*) AS c FROM "
+                        "(SELECT DISTINCT report_id FROM results)"
+                    ).fetchone()["c"],
+                )
+                conn.execute("COMMIT")
+                return True
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
 
 # --------------------------------------------------------------------------- #

@@ -11,6 +11,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -22,6 +23,7 @@ os.environ["BATCH_SIZE"] = "50"
 os.environ["BATCH_DELAY"] = "0"
 
 import app.db as db  # noqa: E402
+from app import hooks  # noqa: E402
 from app.migrator import (  # noqa: E402
     Migrator,
     STATE_COMPLETED,
@@ -43,12 +45,16 @@ def _wait_until(predicate, timeout=30.0, interval=0.05):
 
 class MigrationTestBase(unittest.TestCase):
     def setUp(self):
+        hooks.clear_hooks()
         for name in ("old.db", "new.db", "old.db-wal", "old.db-shm",
                      "new.db-wal", "new.db-shm"):
             p = os.path.join(_TMP, name)
             if os.path.exists(p):
                 os.remove(p)
         db.init_dbs()
+
+    def tearDown(self):
+        hooks.clear_hooks()
 
     def _seed(self, n):
         with db.old_conn() as conn:
@@ -194,14 +200,16 @@ class TestConcurrentWrites(MigrationTestBase):
     def test_correction_during_migration_is_not_lost(self):
         self._seed(400)
         m = Migrator()
+        m.pause_before_cutover = threading.Event()
         m.start()
-        _wait_until(lambda: progress()["batch_no"] >= 1)
+        self.assertTrue(_wait_until(lambda: progress()["state"] == STATE_RUNNING))
 
         # Correct a row that has very likely already been copied, and
-        # insert a brand-new report.
+        # insert a brand-new report, while the engine sits before cutover.
         repo.upsert_report("R00010", "999.0", "888.0")
         repo.upsert_report("R99999", "0.5", None)
 
+        m.pause_before_cutover.set()
         self.assertTrue(_wait_until(
             lambda: progress()["state"] == STATE_COMPLETED
         ))
@@ -382,6 +390,391 @@ class TestCutoverRetry(MigrationTestBase):
             ).fetchone()
         self.assertIsNotNone(logged)
         self._assert_tables_match()
+
+
+class TestCutoverInterleavings(MigrationTestBase):
+    """Deterministic regressions for the read/write switch window.
+
+    Each test pauses a worker at a named checkpoint (see ``app.hooks``) so the
+    exact interleaving is reproduced every run instead of hoping a race
+    happens.
+    """
+
+    def _start_paused(self, n, pause_before_cutover=True):
+        """Start a migration that stalls right before publishing cutover."""
+        self._seed(n)
+        m = Migrator()
+        if pause_before_cutover:
+            m.pause_before_cutover = threading.Event()
+        m.start()
+        self.assertTrue(
+            _wait_until(lambda: progress()["state"] == STATE_RUNNING)
+        )
+        return m
+
+    def _resume_cutover(self, m):
+        if m.pause_before_cutover is not None:
+            m.pause_before_cutover.set()
+        self.assertTrue(
+            _wait_until(lambda: progress()["state"] == STATE_COMPLETED),
+            progress(),
+        )
+
+    # ------------------------------------------------------------------ #
+    # 1. A report committed to the wide table just before the switch must
+    #    not be missing from both stores while the switch takes effect.
+    # ------------------------------------------------------------------ #
+    def test_committed_report_is_visible_through_the_whole_switch(self):
+        m = self._start_paused(120)
+
+        # Commit a brand-new report while migration is paused before cutover.
+        # It is in the wide table but not yet in the long table.
+        repo.upsert_report("LATE01", "0.777", None)
+
+        # Hold cutover at the instant the state is ``cutover`` but the old
+        # write lock is not held yet: old buggy readers switched here and a
+        # report only present in the wide table vanished.
+        state_flipped = threading.Event()
+        release = threading.Event()
+
+        def at_flip(**_kw):
+            state_flipped.set()
+            release.wait(timeout=10)
+
+        hooks.set_hook("cutover_state_flipped", at_flip)
+        m.pause_before_cutover.set()
+
+        self.assertTrue(state_flipped.wait(timeout=10))
+        visible = repo.get_report("LATE01")
+        self.assertIsNotNone(
+            visible, "report committed before cutover vanished mid-switch"
+        )
+        self.assertEqual(visible["chromium"], "0.777")
+        # The listing must contain it too.
+        listed = {r["report_id"] for r in repo.list_reports(limit=200)}
+        self.assertIn("LATE01", listed)
+
+        release.set()
+        hooks.clear_hooks()
+        self.assertTrue(
+            _wait_until(lambda: progress()["state"] == STATE_COMPLETED),
+            progress(),
+        )
+        # And it is visible after the switch, read from the long table.
+        self.assertEqual(
+            repo.get_report("LATE01"),
+            {"report_id": "LATE01", "chromium": "0.777", "lead": None},
+        )
+        self._assert_tables_match()
+
+    def test_no_report_disappears_between_drain_and_completion(self):
+        """Pause between the proven-complete drain and the completion commit."""
+        m = self._start_paused(80)
+        before = threading.Event()
+        release = threading.Event()
+
+        def at_before_completed(**_kw):
+            before.set()
+            release.wait(timeout=10)
+
+        hooks.set_hook("cutover_before_completed", at_before_completed)
+        m.pause_before_cutover.set()
+        self.assertTrue(before.wait(timeout=10))
+
+        # The long table is complete but state is still ``cutover``: every
+        # report must still be readable.
+        for rid in ("R0001", "R0040", "R0080"):
+            self.assertIsNotNone(repo.get_report(rid), rid)
+        self.assertEqual(
+            repo.get_report("R0001"),
+            {"report_id": "R0001", "chromium": "1.1", "lead": "1.2"},
+        )
+        release.set()
+        self.assertTrue(
+            _wait_until(lambda: progress()["state"] == STATE_COMPLETED),
+            progress(),
+        )
+        self._assert_tables_match()
+
+    # ------------------------------------------------------------------ #
+    # 2. An earlier correction committed to the old table must not overwrite
+    #    a newer correction committed after the switch.
+    # ------------------------------------------------------------------ #
+    def test_stale_wide_correction_cannot_overwrite_post_cutover_write(self):
+        m = self._start_paused(60)
+
+        # The "slow" correction: accepted and committed to the wide table
+        # while it is still authoritative, but its request has not returned.
+        wide_committed = threading.Event()
+        release = threading.Event()
+
+        def at_old_committed(**_kw):
+            wide_committed.set()
+            release.wait(timeout=10)
+
+        hooks.set_hook("write_old_committed", at_old_committed)
+        result = {}
+
+        def slow_correction():
+            result["action"] = repo.upsert_report(
+                "R0010", "OLD-VALUE", "OLD-LEAD"
+            )
+
+        t = threading.Thread(target=slow_correction, daemon=True)
+        t.start()
+        self.assertTrue(wide_committed.wait(timeout=10))
+
+        # Cutover drains and completes while the slow request is still
+        # blocked *after* its old-table commit.
+        m.pause_before_cutover.set()
+        self.assertTrue(
+            _wait_until(lambda: progress()["state"] == STATE_COMPLETED),
+            progress(),
+        )
+        # The newer correction succeeds after cutover, on the long table.
+        self.assertEqual(
+            repo.upsert_report("R0010", "NEW-VALUE", "NEW-LEAD"), "updated"
+        )
+
+        # The earlier request returns now.  It must not clobber the newer
+        # value, and it must not write the frozen old table again.
+        release.set()
+        t.join(timeout=10)
+        hooks.clear_hooks()
+
+        self.assertEqual(
+            repo.get_report("R0010"),
+            {"report_id": "R0010", "chromium": "NEW-VALUE",
+             "lead": "NEW-LEAD"},
+        )
+        # The drained value was copied at cutover (the old table is frozen),
+        # and the later direct write is locked against late copies.
+        with db.new_conn() as c:
+            self.assertIsNotNone(
+                c.execute(
+                    "SELECT 1 FROM locked_reports WHERE report_id='R0010'"
+                ).fetchone()
+            )
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(
+                "INSERT OR REPLACE INTO migration_seen VALUES "
+                "('R0010','STALE','STALE')"
+            )
+            c.execute("COMMIT")
+        # A late replication pass must skip the locked row.
+        fresh = Migrator()
+        fresh._reconcile()
+        self.assertEqual(repo.get_report("R0010")["chromium"], "NEW-VALUE")
+
+    def test_inflight_wide_write_cannot_commit_after_completion(self):
+        """A write paused before routing must re-route to the long table."""
+        m = self._start_paused(60)
+        arrived = threading.Event()
+        release = threading.Event()
+
+        def at_before_routing(**_kw):
+            arrived.set()
+            release.wait(timeout=10)
+
+        hooks.set_hook("write_before_routing", at_before_routing)
+        result = {}
+
+        def delayed_write():
+            result["action"] = repo.upsert_report(
+                "R0020", "DEFERRED", "DEFERRED-LEAD"
+            )
+
+        t = threading.Thread(target=delayed_write, daemon=True)
+        t.start()
+        self.assertTrue(arrived.wait(timeout=10))
+
+        # Finish migration while the writer is paused before taking the lock.
+        m.pause_before_cutover.set()
+        self.assertTrue(
+            _wait_until(lambda: progress()["state"] == STATE_COMPLETED),
+            progress(),
+        )
+        release.set()
+        t.join(timeout=10)
+        hooks.clear_hooks()
+
+        self.assertEqual(
+            result["action"], "updated",
+            "the in-flight write did not report success",
+        )
+        # It landed on the long table, not the frozen old table.
+        with db.old_conn() as c:
+            wide = c.execute(
+                "SELECT chromium FROM reports WHERE report_id='R0020'"
+            ).fetchone()
+        self.assertNotEqual(wide["chromium"], "DEFERRED")
+        self.assertEqual(
+            repo.get_report("R0020"),
+            {"report_id": "R0020", "chromium": "DEFERRED",
+             "lead": "DEFERRED-LEAD"},
+        )
+        with db.new_conn() as c:
+            self.assertIsNotNone(
+                c.execute(
+                    "SELECT 1 FROM locked_reports WHERE report_id='R0020'"
+                ).fetchone()
+            )
+
+    def test_write_accepted_during_cutover_lands_in_drained_wide_table(self):
+        """A write during ``cutover`` (before the old lock) is drained, not lost."""
+        m = self._start_paused(40)
+        flipped = threading.Event()
+        release = threading.Event()
+
+        def at_flip(**_kw):
+            flipped.set()
+            release.wait(timeout=10)
+
+        hooks.set_hook("cutover_state_flipped", at_flip)
+        m.pause_before_cutover.set()
+        self.assertTrue(flipped.wait(timeout=10))
+
+        # State is ``cutover`` but cutover's old-DB lock is not held yet; the
+        # application still writes the (still mutable) wide table.
+        self.assertEqual(
+            progress()["state"], "cutover",
+            "expected to be paused in cutover state",
+        )
+        with db.new_conn() as c:
+            self.assertEqual(
+                c.execute(
+                    "SELECT value FROM migration_meta WHERE key='state'"
+                ).fetchone()["value"],
+                "cutover",
+            )
+        self.assertEqual(
+            repo.upsert_report("R0002", "CUTOVER-V", "CUTOVER-L"), "updated"
+        )
+        # It is already readable while still in cutover.
+        self.assertEqual(
+            repo.get_report("R0002"),
+            {"report_id": "R0002", "chromium": "CUTOVER-V",
+             "lead": "CUTOVER-L"},
+        )
+
+        release.set()
+        hooks.clear_hooks()
+        self.assertTrue(
+            _wait_until(lambda: progress()["state"] == STATE_COMPLETED),
+            progress(),
+        )
+        # The cutover drain copied it into the long table.
+        self.assertEqual(
+            repo.get_report("R0002"),
+            {"report_id": "R0002", "chromium": "CUTOVER-V",
+             "lead": "CUTOVER-L"},
+        )
+        self._assert_tables_match()
+
+    def test_write_waiting_on_old_lock_observes_completion(self):
+        """A writer blocked on the cutover's old-DB lock must not write old."""
+        m = self._start_paused(60)
+        locked = threading.Event()
+        release = threading.Event()
+
+        def at_locked(**_kw):
+            locked.set()
+            release.wait(timeout=10)
+
+        hooks.set_hook("cutover_old_db_locked", at_locked)
+        m.pause_before_cutover.set()
+        self.assertTrue(locked.wait(timeout=10), "cutover never locked old")
+
+        # While cutover holds the old write lock, a correction arrives and
+        # blocks inside BEGIN IMMEDIATE.
+        result = {}
+
+        def correction():
+            result["action"] = repo.upsert_report(
+                "R0030", "AFTER-LOCK", "AFTER-LEAD"
+            )
+
+        t = threading.Thread(target=correction, daemon=True)
+        t.start()
+        time.sleep(0.2)  # let it reach the lock wait
+
+        release.set()
+        self.assertTrue(
+            _wait_until(lambda: progress()["state"] == STATE_COMPLETED),
+            progress(),
+        )
+        t.join(timeout=10)
+        hooks.clear_hooks()
+
+        self.assertEqual(result["action"], "updated")
+        with db.old_conn() as c:
+            # R0030 exists in the wide table from seeding (chromium is NULL
+            # for multiples of 10).  The writer was already past routing when
+            # the cutover lock was taken, so it must have re-routed to the
+            # long table and left the frozen wide value untouched.
+            wide = c.execute(
+                "SELECT chromium FROM reports WHERE report_id='R0030'"
+            ).fetchone()
+            frozen = c.execute(
+                "SELECT COUNT(*) c FROM reports"
+            ).fetchone()["c"]
+        self.assertIsNone(wide["chromium"], "write landed on the frozen table")
+        self.assertEqual(
+            repo.get_report("R0030"),
+            {"report_id": "R0030", "chromium": "AFTER-LOCK",
+             "lead": "AFTER-LEAD"},
+        )
+        self.assertEqual(frozen, 60)
+
+    def test_old_table_frozen_after_completion_even_for_racing_writes(self):
+        m = self._start_paused(50)
+        stop = threading.Event()
+        writes = []
+
+        def writer(i):
+            try:
+                writes.append(repo.upsert_report(
+                    f"R{(i % 50) + 1:04d}", f"v{i}", f"w{i}"
+                ))
+            except Exception as exc:  # pragma: no cover - fail loudly
+                writes.append(repr(exc))
+
+        m.pause_before_cutover.set()
+        self.assertTrue(
+            _wait_until(lambda: progress()["state"] == STATE_COMPLETED),
+            progress(),
+        )
+        with db.old_conn() as c:
+            frozen_ids = {
+                r["report_id"]
+                for r in c.execute("SELECT report_id FROM reports")
+            }
+            frozen_count = c.execute(
+                "SELECT COUNT(*) c FROM reports"
+            ).fetchone()["c"]
+        threads = [
+            threading.Thread(target=writer, args=(i,), daemon=True)
+            for i in range(12)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        with db.old_conn() as c:
+            after_ids = {
+                r["report_id"]
+                for r in c.execute("SELECT report_id FROM reports")
+            }
+            after_count = c.execute(
+                "SELECT COUNT(*) c FROM reports"
+            ).fetchone()["c"]
+        self.assertEqual(frozen_ids, after_ids)
+        self.assertEqual(frozen_count, after_count)
+        # Every racing write is readable from the long table.
+        for i in range(12):
+            self.assertEqual(
+                repo.get_report(f"R{(i % 50) + 1:04d}")["chromium"], f"v{i}"
+            )
 
 
 if __name__ == "__main__":

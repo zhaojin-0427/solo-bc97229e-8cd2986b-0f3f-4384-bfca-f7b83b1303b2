@@ -97,7 +97,7 @@
           <button type="submit">提交</button>
         </div>
         <p class="muted" style="margin-top:10px">
-          当前写入路由：{% if progress.state in ('cutover','completed') %}长表 <b>results</b>（迁移完成后旧表只读）{% else %}宽表 <b>reports</b>（迁移期间照常提交，更正不会丢失）{% endif %}
+          当前写入路由：{% if progress.state == 'completed' %}长表 <b>results</b>（迁移完成后旧表只读）{% elif progress.state == 'cutover' %}宽表 <b>reports</b>（正在加锁切换，写仍先提交到旧表并会被排水）{% else %}宽表 <b>reports</b>（迁移期间照常提交，更正不会丢失）{% endif %}
         </p>
       </form>
     </section>

@@ -1,0 +1,23 @@
+services:
+  migration-web:
+    build: .
+    image: water-lab-migration:latest
+    container_name: water-lab-migration
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      BATCH_SIZE: "200"
+      BATCH_DELAY: "0.2"
+    volumes:
+      - migration-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  migration-data:

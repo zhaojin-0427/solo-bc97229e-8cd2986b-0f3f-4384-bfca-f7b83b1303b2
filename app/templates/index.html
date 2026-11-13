@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>水质检测库 · 宽表转长表迁移台</title>
+  <style>
+    :root { --blue:#1f6feb; --green:#1a7f37; --amber:#9a6700; --red:#cf222e; --bg:#f6f8fa; --line:#d0d7de; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", Segoe UI, sans-serif; background:var(--bg); color:#1f2328; }
+    header { background:#0d1117; color:#fff; padding:16px 28px; }
+    header h1 { margin:0; font-size:18px; }
+    header p { margin:4px 0 0; color:#9da7b3; font-size:13px; }
+    main { max-width:1080px; margin:24px auto; padding:0 20px; display:grid; gap:20px; }
+    .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:20px; }
+    .card h2 { margin:0 0 14px; font-size:15px; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+    @media (max-width:860px){ .grid2 { grid-template-columns:1fr; } }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }
+    th { background:var(--bg); font-weight:600; }
+    td.null { color:#8c959f; font-style:italic; }
+    form .row { display:flex; gap:10px; flex-wrap:wrap; }
+    label { font-size:12px; color:#57606a; display:block; margin-bottom:4px; }
+    input[type=text] { padding:8px 10px; border:1px solid var(--line); border-radius:6px; font-size:13px; min-width:140px; }
+    button { padding:8px 16px; border:0; border-radius:6px; background:var(--blue); color:#fff; font-size:13px; cursor:pointer; align-self:flex-end; }
+    button.secondary { background:#57606a; }
+    button:disabled { background:#8c959f; cursor:not-allowed; }
+    .badge { display:inline-block; padding:3px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+    .badge.idle { background:#eaeef2; color:#57606a; }
+    .badge.running, .badge.cutover { background:#fff8c5; color:var(--amber); }
+    .badge.completed { background:#dafbe1; color:var(--green); }
+    .badge.failed { background:#ffebe9; color:var(--red); }
+    .bar { height:10px; background:#eaeef2; border-radius:999px; overflow:hidden; margin:10px 0; }
+    .bar > div { height:100%; background:var(--blue); transition:width .4s; }
+    .kv { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; font-size:13px; }
+    .kv div { background:var(--bg); border-radius:8px; padding:10px; }
+    .kv b { display:block; font-size:16px; margin-top:2px; }
+    .muted { color:#656d76; font-size:12px; }
+    .error-list { max-height:180px; overflow:auto; }
+    .error-list td { color:var(--red); }
+    .notice { background:#dafbe1; border:1px solid #4ac26b; color:var(--green); padding:8px 14px; border-radius:8px; font-size:13px; }
+    a { color:var(--blue); text-decoration:none; }
+    code { background:#eff1f3; padding:1px 5px; border-radius:4px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>水质检测宽表 → 长表在线迁移台</h1>
+  <p>旧库 reports(report_id, chromium, lead) ｜ 新库 results(report_id, item, value) ｜ Flask + SQLite + 后台分批迁移</p>
+</header>
+<main>
+  {% if request.args.get('notice') %}
+  <div class="notice">操作已提交：{{ request.args.get('notice') }}（新增=inserted，整行更正=updated）</div>
+  {% endif %}
+
+  <section class="card">
+    <h2>① 迁移状态与进度 <span class="badge {{ progress.state }}">{{ progress.state }}</span></h2>
+    <div class="kv">
+      <div>宽表报告数<b id="wide-total">{{ progress.wide_total }}</b></div>
+      <div>长表报告数<b id="long-total">{{ progress.long_total }}</b></div>
+      <div>已完成批次<b id="batch-no">{{ progress.batch_no }}</b></div>
+      <div>进度<b><span id="pct">{{ progress.percent }}</span>%</b></div>
+    </div>
+    <div class="bar"><div id="bar" style="width:{{ progress.percent }}%"></div></div>
+    <p class="muted">
+      扫描水位 report_id = <code id="last-id">{{ progress.last_id or '—' }}</code>
+      ｜ 开始 {{ progress.started_at or '—' }} ｜ 完成 {{ progress.completed_at or '—' }}
+      ｜ 错误 <b id="err-count">{{ progress.error_count }}</b>
+    </p>
+    <form method="post" action="{{ url_for('start_migration') }}">
+      <button type="submit" {% if progress.state in ('running','cutover','completed') %}disabled{% endif %}>
+        启动 / 续跑迁移
+      </button>
+      {% if progress.state == 'failed' %}<span class="muted">迁移失败：{{ progress.last_error }}（检查数据后重新点击即可从断点续跑）</span>{% endif %}
+    </form>
+    <div id="errors" class="error-list" {% if not progress.recent_errors %}hidden{% endif %}>
+      <table>
+        <thead><tr><th>#</th><th>批次</th><th>报告号</th><th>错误</th><th>时间</th></tr></thead>
+        <tbody id="error-body">
+        {% for e in progress.recent_errors %}
+          <tr><td>{{ e.id }}</td><td>{{ e.batch_no }}</td><td>{{ e.report_id }}</td><td>{{ e.message }}</td><td>{{ e.created_at }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="grid2">
+    <section class="card">
+      <h2>② 新增报告 / 整行更正</h2>
+      <form method="post" action="{{ url_for('create_or_correct') }}">
+        <div class="row">
+          <div><label>报告号 report_id</label><input type="text" name="report_id" required placeholder="如 R00001"></div>
+          <div><label>chromium（留空=NULL）</label><input type="text" name="chromium" placeholder="可空文本"></div>
+          <div><label>lead（留空=NULL）</label><input type="text" name="lead" placeholder="可空文本"></div>
+          <button type="submit">提交</button>
+        </div>
+        <p class="muted" style="margin-top:10px">
+          当前写入路由：{% if progress.state in ('cutover','completed') %}长表 <b>results</b>（迁移完成后旧表只读）{% else %}宽表 <b>reports</b>（迁移期间照常提交，更正不会丢失）{% endif %}
+        </p>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>③ 按报告号查询</h2>
+      <form action="#" onsubmit="location='/reports/'+encodeURIComponent(this.q.value.trim());return false;">
+        <div class="row">
+          <div style="flex:1"><label>报告号</label><input type="text" name="q" required placeholder="如 R00042" style="width:100%"></div>
+          <button type="submit" class="secondary">查询</button>
+        </div>
+      </form>
+      <p class="muted" style="margin-top:10px">JSON 接口：<code>GET /api/reports/&lt;报告号&gt;</code> ｜ 进度接口：<code>GET /api/progress</code></p>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>④ 最近报告（最多 50 条，按报告号排序）</h2>
+    <table>
+      <thead><tr><th>报告号</th><th>chromium</th><th>lead</th><th>操作</th></tr></thead>
+      <tbody>
+      {% for r in reports %}
+        <tr>
+          <td>{{ r.report_id }}</td>
+          <td class="{{ 'null' if r.chromium is none else '' }}">{{ r.chromium if r.chromium is not none else 'NULL' }}</td>
+          <td class="{{ 'null' if r.lead is none else '' }}">{{ r.lead if r.lead is not none else 'NULL' }}</td>
+          <td><a href="{{ url_for('query_report', report_id=r.report_id) }}">查看</a></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="muted">暂无数据</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+// 迁移运行时每 2 秒刷新一次进度，页面保持可操作（查询/写入不被轮询阻塞）。
+async function poll() {
+  try {
+    const r = await fetch('/api/progress');
+    const p = await r.json();
+    document.getElementById('wide-total').textContent = p.wide_total;
+    document.getElementById('long-total').textContent = p.long_total;
+    document.getElementById('batch-no').textContent = p.batch_no;
+    document.getElementById('pct').textContent = p.percent;
+    document.getElementById('bar').style.width = p.percent + '%';
+    document.getElementById('last-id').textContent = p.last_id || '—';
+    document.getElementById('err-count').textContent = p.error_count;
+    const box = document.getElementById('errors');
+    if (p.recent_errors && p.recent_errors.length) {
+      box.hidden = false;
+      document.getElementById('error-body').innerHTML = p.recent_errors.map(e =>
+        `<tr><td>${e.id}</td><td>${e.batch_no}</td><td>${e.report_id ?? ''}</td><td>${e.message}</td><td>${e.created_at}</td></tr>`
+      ).join('');
+    }
+  } catch (e) { /* 短暂网络抖动忽略 */ }
+}
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

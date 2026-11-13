@@ -1,0 +1,137 @@
+"""End-to-end web tests through the Flask test client.
+
+Flask lives in an external prefix here (see /tmp/pylibs during local
+verification); run with that prefix on PYTHONPATH, e.g.
+
+    PYTHONPATH=/workspace:/tmp/pylibs python /workspace/tests/test_web.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_TMP = tempfile.mkdtemp(prefix="migration-web-")
+os.environ["DATA_DIR"] = _TMP
+os.environ["BATCH_SIZE"] = "25"
+os.environ["BATCH_DELAY"] = "0"
+
+from app import create_app  # noqa: E402
+from app.migrator import migrator, progress  # noqa: E402
+
+app = create_app(seed_demo=True)
+client = app.test_client()
+
+
+def _wait_state(target, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if progress()["state"] == target:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_index_renders_seed_data():
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "迁移台" in resp.get_data(as_text=True)
+    assert b"R00001" in resp.data
+
+
+def test_api_query_and_null_preservation():
+    resp = client.get("/api/reports/R00017")  # 17 is a multiple of 17 -> NULL
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["report_id"] == "R00017"
+    assert body["chromium"] is None  # NULL stays NULL through both stores
+
+
+def test_insert_and_correct_while_running():
+    # Insert a brand-new report with one NULL and one value.
+    resp = client.post("/reports", data={
+        "report_id": "WEB001", "chromium": "0.42", "lead": "",
+    })
+    assert resp.status_code in (302, 303)
+    body = client.get("/api/reports/WEB001").get_json()
+    assert body == {"report_id": "WEB001", "chromium": "0.42", "lead": None}
+
+    # Full-row correction.
+    client.post("/reports", data={
+        "report_id": "WEB001", "chromium": "0.99", "lead": "0.11",
+    })
+    body = client.get("/api/reports/WEB001").get_json()
+    assert body["chromium"] == "0.99" and body["lead"] == "0.11"
+
+
+def test_full_migration_via_web_and_cutover_writes():
+    resp = client.post("/migration/start")
+    assert resp.status_code in (302, 303)
+    assert _wait_state("completed"), progress()
+
+    p = client.get("/api/progress").get_json()
+    assert p["state"] == "completed"
+    assert p["long_total"] == p["wide_total"]
+    assert p["percent"] == 100.0
+
+    # After completion writes land in the long table only.
+    client.post("/reports", data={
+        "report_id": "WEB002", "chromium": "7.7", "lead": "8.8",
+    })
+    body = client.get("/api/reports/WEB002").get_json()
+    assert body["chromium"] == "7.7"
+
+    # Old table stays frozen.
+    from app import db
+    with db.old_conn() as conn:
+        frozen = conn.execute(
+            "SELECT 1 FROM reports WHERE report_id='WEB002'"
+        ).fetchone()
+    assert frozen is None
+
+    # Starting again is a no-op.
+    assert migrator.start() is False
+
+    # Long table has exactly two rows per report including NULL values.
+    with db.new_conn() as conn:
+        bad = conn.execute(
+            "SELECT report_id, COUNT(*) c FROM results "
+            "GROUP BY report_id HAVING c != 2"
+        ).fetchall()
+    assert not bad
+
+
+def test_query_unknown_returns_404():
+    resp = client.get("/api/reports/NO-SUCH-ID")
+    assert resp.status_code == 404
+    page = client.get("/reports/NO-SUCH-ID")
+    assert page.status_code == 200 and "未找到" in page.get_data(as_text=True)
+
+
+def test_validation_error():
+    resp = client.post("/reports", data={"report_id": "  "})
+    assert resp.status_code == 400
+
+
+def test_healthz():
+    assert client.get("/healthz").get_json() == {"status": "ok"}
+
+
+if __name__ == "__main__":
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {name}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                print(f"ERROR {name}: {exc!r}")
+    print(f"\n{'ALL WEB TESTS PASSED' if failures == 0 else f'{failures} FAILURES'}")
+    raise SystemExit(1 if failures else 0)

@@ -1,0 +1,129 @@
+# 水质检测库 · 宽表 → 长表在线迁移台
+
+Flask + SQLite 实现的在线数据迁移控制台：把持续接收更正的宽表
+`reports(report_id PRIMARY KEY, chromium, lead)`（检测值为**可空文本**）
+迁移为下游按项目取数的长表 `results(report_id, item, value)`，每份报告
+固定产出 `chromium`、`lead` 两行，**NULL 原样保留**。
+
+## 一键启动
+
+```bash
+docker compose up --build
+# 打开 http://localhost:8000
+```
+
+容器首次启动会在持久化卷 `migration-data` 中创建两个 SQLite 库并写入
+1200 条演示报告（含 NULL 与空字符串，种子过程幂等，重启不覆盖人工更正）。
+
+网页操作：
+
+1. **启动迁移**：点击「启动 / 续跑迁移」，进度面板每 2 秒自动刷新；
+2. **新增 / 整行更正**：迁移进行中照常提交，无需停业务；
+3. **按报告号查询**：网页表单或 `GET /api/reports/<报告号>`；
+4. **进度与错误**：页面顶部与 `GET /api/progress` 实时可见。
+
+## 架构与关键保证
+
+```
+                ┌──────────────────────── 容器（gunicorn 1 worker / 8 threads）──────────────────────┐
+浏览器 ──HTTP──▶ │ Flask 路由 ──▶ repository（按状态路由）──▶ old.db / new.db                         │
+                │                   ▲                              ▲                                  │
+                │           后台 migrator 线程：分批扫描 → 转换 → 对账 → 加锁切换                     │
+                └──────────────────────────────────────────────────────────────────────────────────┘
+                      /data/old.db（业务宽表）      /data/new.db（长表 + 迁移账本，命名卷持久化）
+```
+
+### 1. 迁移不占用业务库写事务
+
+物理上拆成两个数据库文件。迁移线程只对 `old.db` 执行 `SELECT`，所有写操作
+（长表数据、批次跟踪、进度元数据、错误记录）都在 `new.db` 上完成；两个库
+均开启 WAL，业务写入与迁移写入互不阻塞，查询始终响应。
+
+### 2. 分批 + 断点续跑，重启不重复整库复制
+
+- 按 `report_id > 水位线 ORDER BY report_id LIMIT BATCH_SIZE` 增量扫描；
+- 每批在 **`new.db` 单个事务**内同时提交：转换后的长表行、逐行快照
+  `migration_seen`、新水位线 `last_report_id`、批次号 `last_batch`；
+- 进程/容器重启后，后台线程自动从持久化水位线续跑（已验证：批次号从 4
+  继续到 24，而非从 0 重新复制）。
+
+### 3. 更正不丢失：增量扫描 + 全量对账
+
+水位扫描只能发现“新尾部”，因此到达尾部后执行**全量对账**：把宽表逐行与
+`migration_seen` 快照比对，任何迁移期间提交的整行更正（包括水位线之前的
+报告）都会被重新复制，直到零差异才进入切换。
+
+### 4. 原子切换：完成状态与读写切换同时生效
+
+`cutover` 步骤：
+
+1. 元数据状态置为 `cutover`（此后应用写直接落长表并登记 `locked_reports`）；
+2. 对 `old.db` 执行 `BEGIN IMMEDIATE` 取得写锁——在途写事务先完成，新写
+   靠 `busy_timeout` 等待，保证拿到锁后看到的是最后一个已提交版本；
+3. 持锁做最后一次对账排水；
+4. 在 `new.db` 事务内把状态置为 `completed`，随后释放旧库锁。
+
+`completed` 之后应用**只读长表、只写长表**，旧表永久冻结（有测试断言旧表
+行数不再变化）。
+
+### 5. 迟到复制不能覆盖新值
+
+应用直接写长表的报告会进入 `locked_reports`。迁移线程在批量复制与对账两条
+路径上都会跳过这些 report_id——即使旧表里残留更“新”的宽表值，迟到的复制
+也无法覆盖长表上的新值（有专门测试：旧表写入 `STALE` 后再迁移，长表值不变）。
+
+### 6. 错误可见、可续跑
+
+单行转换失败写入 `migration_errors`（批次、报告号、信息、时间）并在网页展示，
+不会中断整批；切换阶段若因 SQLite 锁竞争等 `sqlite3.Error` 失败，状态自动回退
+到 `running` 并记录错误，下一轮自动重试，无需人工干预；致命错误才置 `failed`，
+修复后再次点击启动即从断点继续。
+
+### 7. 持续更正 workload 下也能完成
+
+切换不等待“静默期”：尾部扫描完成并做一次全量对账后立即进入带写锁的 cutover，
+在锁内完成最后排水——即使写线程永不停歇，迁移也必然收敛（有回归测试与
+4 线程压力测试覆盖：323 次切换窗口写入零丢失、零迟到覆盖）。
+
+## HTTP / JSON 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET`  | `/` | 迁移控制台页面（进度、表单、报告列表） |
+| `POST` | `/reports` | 新增或整行更正（表单 `report_id,chromium,lead`，留空=NULL） |
+| `GET`  | `/reports/<id>` | 网页版单报告查询 |
+| `GET`  | `/api/reports/<id>` | JSON 单报告查询，不存在返回 404 |
+| `POST` | `/migration/start` | 启动/续跑迁移（完成后再调为 no-op） |
+| `GET`  | `/api/progress` | 状态、水位、批次、百分比、错误列表 |
+| `GET`  | `/healthz` | 容器健康检查 |
+
+## 本地测试（无需 Docker）
+
+引擎测试只用标准库，Flask 集成测试需要安装依赖：
+
+```bash
+python3 -I tests/test_migration.py                      # 9 项：NULL 语义、断点续跑、并发更正、持续更正收敛、切换失败重试、冻结旧表、迟到复制…
+pip install -r requirements.txt && python3 tests/test_web.py   # 7 项 Web 端到端
+```
+
+## 文件说明
+
+```
+app/db.py          两个 SQLite 库的连接、WAL、全部建表与元数据
+app/repository.py  业务读写：按迁移状态在宽表/长表间路由，NULL 规范化
+app/migrator.py    后台引擎：分批扫描、转换、全量对账、加锁切换、进度查询
+app/seed.py        幂等演示数据（1200 条）
+app/web.py         Flask 路由
+app/templates/     控制台页面（中文 UI，自动刷新进度）
+tests/             引擎测试（stdlib）+ Web 集成测试
+Dockerfile         python:3.12-slim，gunicorn 单 worker 多线程
+docker-compose.yml 命名卷持久化 /data，含 healthcheck
+```
+
+## 可调环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DATA_DIR` | `/data` | 两个 SQLite 文件所在目录（容器内挂卷） |
+| `BATCH_SIZE` | `200` | 每批扫描的报告行数 |
+| `BATCH_DELAY` | `0.25` | 批次间让步秒数，便于观察进度 |
